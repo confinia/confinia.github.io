@@ -133,14 +133,46 @@ const COUNTRY_NAMES = {
 // (autres pays : unités communales chargées selon la vue courante).
 let mode = "dept", areaCountry = null;
 
+// État dans l'URL (#z=…&c=lat,lon&at=YYYY-MM&dept=01|country=DE) : partager
+// une vue, y revenir, naviguer avec précédent/suivant.
+function parseHash() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const c = (h.get("c") || "").split(",").map(Number);
+  return { z: parseFloat(h.get("z")), c: c.length === 2 && c.every(isFinite) ? c : null,
+           at: h.get("at"), dept: h.get("dept"), country: h.get("country") };
+}
+const H = parseHash();
+if (H.at) {
+  const i = DATES.findIndex(d => d.slice(0, 7) === H.at);
+  if (i >= 0) slider.value = i;
+}
+
 const map = new maplibregl.Map({
   container: "map",
   style: { version: 8, sources: {},
     glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
     layers: [
       { id: "bg", type: "background", paint: { "background-color": "#10151d" } } ] },
-  center: [5.7, 46.05], zoom: 9, maxZoom: 15, attributionControl: false,
+  // Défaut : l'hexagone entier ; sinon la vue mémorisée dans l'URL.
+  center: H.c ? [H.c[1], H.c[0]] : [2.45, 46.6],
+  zoom: isFinite(H.z) ? H.z : 5.3,
+  maxZoom: 15, attributionControl: false,
 });
+
+let hashTimer = null;
+function writeHash() {
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    const c = map.getCenter();
+    const parts = [`z=${map.getZoom().toFixed(2)}`,
+                   `c=${c.lat.toFixed(4)},${c.lng.toFixed(4)}`,
+                   `at=${DATES[slider.value].slice(0, 7)}`,
+                   mode === "area" ? `country=${areaCountry}`
+                                   : `dept=${document.getElementById("dept").value.trim()}`];
+    history.replaceState(null, "", "#" + parts.join("&"));
+  }, 300);
+}
+map.on("moveend", writeHash);
 map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
 
 const DEPT_NAMES = {
@@ -207,6 +239,32 @@ async function addEuropeLayer() {
       paint: { "text-color": "#6c7f9e", "text-halo-color": "#0b0f16",
                "text-halo-width": 1.2 } });
   } catch { /* toile de fond optionnelle */ }
+}
+
+// Régions intermédiaires hors France : NUTS 3 (cantons suisses, Kreise
+// allemands, provinces…) — l'équivalent des départements, depuis nos données.
+async function addRegionLayer() {
+  try {
+    const r = await fetch(`${API}/v1/nuts?level=3&at=2024-06-01`);
+    if (!r.ok) return;
+    const fc = await r.json();
+    fc.features = fc.features.filter(f => f.properties.country !== "FR" && f.geometry);
+    const labels = { type: "FeatureCollection", features: fc.features.map(f => {
+      const pt = labelPoint(f.geometry);
+      return pt && { type: "Feature", geometry: { type: "Point", coordinates: pt },
+                     properties: { label: f.properties.nom } };
+    }).filter(Boolean) };
+    map.addSource("regions", { type: "geojson", data: fc });
+    map.addSource("region-labels", { type: "geojson", data: labels });
+    map.addLayer({ id: "regions-line", type: "line", source: "regions",
+      paint: { "line-color": "#3a4a66", "line-width": 0.9 } }, "communes-fill");
+    map.addLayer({ id: "region-names", type: "symbol", source: "region-labels",
+      minzoom: 6, maxzoom: 9.5,
+      layout: { "text-field": ["get", "label"], "text-font": ["Open Sans Semibold"],
+                "text-size": 10.5 },
+      paint: { "text-color": "#8194b5", "text-halo-color": "#0b0f16",
+               "text-halo-width": 1.2 } });
+  } catch { /* couche de navigation optionnelle */ }
 }
 
 async function addDeptLayer() {
@@ -281,7 +339,14 @@ async function fetchState(dept, date) {
   return cache.get(key);
 }
 
-let firstFit = true;
+// Mode initial depuis l'URL (pays ou département).
+if (H.country && /^[A-Z]{2}$/.test(H.country)) {
+  mode = "area"; areaCountry = H.country;
+} else if (H.dept && DEPT_RE.test(H.dept)) {
+  document.getElementById("dept").value = H.dept;
+}
+
+let firstFit = false;   // défaut : vue France entière — pas d'auto-zoom initial
 function fitTo(fc) {
   let [minX, minY, maxX, maxY] = [180, 90, -180, -90];
   const scan = c => { if (typeof c[0] === "number") {
@@ -314,6 +379,7 @@ async function render() {
   const date = DATES[slider.value];
   $("datefr").textContent = "au " + FR_DATE.format(new Date(date + "T00:00:00Z"));
   if (month.value !== date.slice(0, 7)) month.value = date.slice(0, 7);
+  writeHash();
   if (mode === "area") return renderArea();
   const dept = $("dept").value.trim();
   if (!DEPT_RE.test(dept)) return;
@@ -380,9 +446,9 @@ map.on("load", () => {
               "symbol-sort-key": ["get", "rank"] },
     paint: { "text-color": "#ffffff", "text-halo-color": "#0b0f16",
              "text-halo-width": 1.3, "text-opacity": 0.9 } });
-  // Ordre d'insertion (chacune sous les communes) : pays d'abord, départements
-  // ensuite — les départements se posent au-dessus des pays.
-  addEuropeLayer().then(addDeptLayer);
+  // Ordre d'insertion (chacune sous les communes) : pays, puis départements FR,
+  // puis régions NUTS 3 — chaque couche se pose au-dessus de la précédente.
+  addEuropeLayer().then(addDeptLayer).then(addRegionLayer);
   render();
 
   const info = $("info");
