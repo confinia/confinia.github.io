@@ -73,8 +73,9 @@
     <span id="count"></span>
   </div>
   <div id="hint">🖱 molette / boutons en bas à droite : zoom · <b>cliquez n'importe où en
-    Europe</b> : un département français s'ouvre entier, ailleurs les communes se chargent
-    selon la vue (zoomez ≥ 7) · dates civiles de validité (état au 1ᵉʳ jour du mois choisi)</div>
+    Europe</b> : la « région-département » s'ouvre entière (département FR, Land DE, province,
+    canton…) · dates civiles de validité (état au 1ᵉʳ jour du mois choisi) · l'URL mémorise
+    la vue — partagez-la</div>
 </header>
 <div id="info"></div>
 <div id="flash"></div>
@@ -138,9 +139,12 @@ const DE_LAENDER = {
   "15": "Sachsen-Anhalt", "16": "Thüringen",
 };
 
-// Mode d'affichage : "dept" (France, département entier), "region" (Allemagne,
-// Land entier) ou "area" (autres pays : unités chargées selon la vue).
-let mode = "dept", areaCountry = null, regionPrefix = null;
+// Mode d'affichage : "dept" (France, département entier), "region" (tout autre
+// pays : la région NUTS entière — Land DE, province IT, canton CH…) ou "area"
+// (secours : unités chargées selon la vue).
+let mode = "dept", areaCountry = null, regionCode = null, regionName = "";
+// Niveau NUTS du « département » par pays : Länder pour l'Allemagne, sinon NUTS 3.
+const REGION_LEVEL = { DE: 1 };
 
 // État dans l'URL (#z=…&c=lat,lon&at=YYYY-MM&dept=01|country=DE) : partager
 // une vue, y revenir, naviguer avec précédent/suivant.
@@ -177,7 +181,7 @@ function writeHash() {
                    `c=${c.lat.toFixed(4)},${c.lng.toFixed(4)}`,
                    `at=${DATES[slider.value].slice(0, 7)}`,
                    mode === "area" ? `country=${areaCountry}` :
-                   mode === "region" ? `country=DE&land=${regionPrefix}`
+                   mode === "region" ? `region=${regionCode}`
                                      : `dept=${document.getElementById("dept").value.trim()}`];
     history.replaceState(null, "", "#" + parts.join("&"));
   }, 300);
@@ -357,10 +361,10 @@ async function fetchState(dept, date) {
   return cache.get(key);
 }
 
-// Mode initial depuis l'URL (Land allemand, pays ou département).
-const H_land = new URLSearchParams(location.hash.slice(1)).get("land");
-if (H.country === "DE" && H_land && DE_LAENDER[H_land]) {
-  mode = "region"; regionPrefix = H_land;
+// Mode initial depuis l'URL (région NUTS, pays ou département).
+const H_region = new URLSearchParams(location.hash.slice(1)).get("region");
+if (H_region && /^[0-9A-Z]{3,5}$/.test(H_region)) {
+  mode = "region"; regionCode = H_region;
 } else if (H.country && /^[A-Z]{2}$/.test(H.country)) {
   mode = "area"; areaCountry = H.country;
 } else if (H.dept && DEPT_RE.test(H.dept)) {
@@ -417,22 +421,25 @@ async function render() {
   }
 }
 
-// Allemagne : le Land entier, comme un département français (préfixe AGS).
+// Hors de France : la région NUTS entière, comme un département français
+// (Land allemand, province italienne, canton suisse… — jointure spatiale API).
 async function renderRegion() {
   const date = DATES[slider.value];
-  $("dept").value = regionPrefix;
-  $("deptname").textContent = `${DE_LAENDER[regionPrefix] || regionPrefix} · Allemagne`;
-  const key = `DE:${regionPrefix}|${date}`;
+  const country = regionCode.slice(0, 2);
+  $("dept").value = country;
+  $("deptname").textContent =
+    `${regionName || regionCode} · ${COUNTRY_NAMES[country] || country}`;
+  const key = `${regionCode}|${date}`;
   const ticket = ++pending;
   try {
     if (!cache.has(key)) {
-      const r = await fetch(`${API}/v1/units?region=${regionPrefix}&country=DE&at=${date}`);
+      const r = await fetch(`${API}/v1/units?nuts=${regionCode}&at=${date}`);
       if (!r.ok) throw new Error(`API ${r.status}`);
       cache.set(key, decorate(await r.json()));
     }
     const decorated = cache.get(key);
     if (ticket !== pending) return;
-    show(decorated, `${decorated.fc.features.length} Gemeinden`);
+    show(decorated, `${decorated.fc.features.length} unités · ${regionName || regionCode}`);
     if (firstFit && decorated.fc.features.length) { fitTo(decorated.fc); firstFit = false; }
   } catch {
     $("count").textContent = "erreur API";
@@ -522,8 +529,8 @@ map.on("load", () => {
       if (country === "FR") {
         mode = "dept";
         const dept = deptOf(f.properties.code);
-        if (dept !== $("dept").value.trim() || areaCountry || regionPrefix) {
-          areaCountry = null; regionPrefix = null;
+        if (dept !== $("dept").value.trim() || areaCountry || regionCode) {
+          areaCountry = null; regionCode = null;
           clearCommunes();
           $("dept").value = dept;
           firstFit = true;
@@ -531,28 +538,29 @@ map.on("load", () => {
           render();
           flash(`Département ${dept} — ${f.properties.nom}`);
         }
-      } else if (country === "DE") {
-        // Land entier, comme un département français.
-        const land = f.properties.code.slice(0, 2);
-        if (mode !== "region" || regionPrefix !== land) {
-          clearCommunes();
-          mode = "region"; regionPrefix = land; areaCountry = null;
-          firstFit = true;
-          render();
-          flash(`${DE_LAENDER[land] || land} — ${f.properties.nom}`);
-        }
       } else {
-        if (mode !== "area" || areaCountry !== country) clearCommunes();
-        mode = "area";
-        areaCountry = country;
-        regionPrefix = null;
-        flash(`${f.properties.nom} · ${COUNTRY_NAMES[country] || country}`);
-        // Amener la vue là où l'on a cliqué : les communes chargent sans étape.
-        if (map.getZoom() < 8) {
-          map.easeTo({ center: [lng, lat], zoom: 8.6, duration: 700 });
-          // moveend déclenchera renderArea()
+        // La région NUTS entière, comme un département (Land, province, canton…).
+        const lvl = REGION_LEVEL[country] ?? 3;
+        const rn = await fetch(
+          `${API}/v1/nuts?lat=${lat.toFixed(5)}&lon=${lng.toFixed(5)}&level=${lvl}&at=${date}`);
+        if (rn.ok) {
+          const reg = await rn.json();
+          if (mode !== "region" || regionCode !== reg.properties.code) {
+            clearCommunes();
+            mode = "region"; areaCountry = null;
+            regionCode = reg.properties.code;
+            regionName = reg.properties.nom;
+            firstFit = true;
+            render();
+            flash(`${regionName} — ${f.properties.nom}`);
+          }
         } else {
-          render();
+          // Secours : chargement selon la vue.
+          if (mode !== "area" || areaCountry !== country) clearCommunes();
+          mode = "area"; areaCountry = country; regionCode = null;
+          flash(`${f.properties.nom} · ${COUNTRY_NAMES[country] || country}`);
+          if (map.getZoom() < 8) map.easeTo({ center: [lng, lat], zoom: 8.6, duration: 700 });
+          else render();
         }
       }
     } catch { flash("Requête impossible — réessayez."); }
@@ -571,7 +579,7 @@ month.addEventListener("change", () => {
 });
 $("dept").addEventListener("change", () => {
   if (!DEPT_RE.test($("dept").value.trim())) return;   // codes pays : via clic carte
-  mode = "dept"; areaCountry = null; regionPrefix = null;
+  mode = "dept"; areaCountry = null; regionCode = null;
   firstFit = true; cacheWarm(); debouncedRender();
 });
 
