@@ -296,6 +296,12 @@ const FR_DATE = new Intl.DateTimeFormat("fr-FR",
   { day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
 
 let pending = 0;
+function clearCommunes() {
+  const empty = { type: "FeatureCollection", features: [] };
+  map.getSource("communes")?.setData(empty);
+  map.getSource("commune-labels")?.setData(empty);
+}
+
 function show(decorated, countLabel) {
   const src = map.getSource("communes");
   if (!src) return;                              // carte pas encore chargée
@@ -328,7 +334,11 @@ async function renderArea() {
   const date = DATES[slider.value];
   $("dept").value = areaCountry;
   $("deptname").textContent = COUNTRY_NAMES[areaCountry] || areaCountry;
-  if (map.getZoom() < 7) { $("count").textContent = "zoomez pour charger"; return; }
+  if (map.getZoom() < 7) {
+    clearCommunes();
+    $("count").textContent = `zoomez (≥ 7) pour ${areaCountry} — ou cliquez un autre pays`;
+    return;
+  }
   const b = map.getBounds();
   const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
     .map(v => v.toFixed(3)).join(",");
@@ -404,6 +414,7 @@ map.on("load", () => {
         const dept = deptOf(f.properties.code);
         if (dept !== $("dept").value.trim() || areaCountry) {
           areaCountry = null;
+          clearCommunes();
           $("dept").value = dept;
           firstFit = true;
           cacheWarm();
@@ -411,10 +422,17 @@ map.on("load", () => {
           flash(`Département ${dept} — ${f.properties.nom}`);
         }
       } else {
+        if (mode !== "area" || areaCountry !== country) clearCommunes();
         mode = "area";
         areaCountry = country;
         flash(`${f.properties.nom} · ${COUNTRY_NAMES[country] || country}`);
-        render();
+        // Amener la vue là où l'on a cliqué : les communes chargent sans étape.
+        if (map.getZoom() < 8) {
+          map.easeTo({ center: [lng, lat], zoom: 8.6, duration: 700 });
+          // moveend déclenchera renderArea()
+        } else {
+          render();
+        }
       }
     } catch { flash("Requête impossible — réessayez."); }
   });
